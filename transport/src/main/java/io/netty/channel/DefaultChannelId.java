@@ -23,6 +23,9 @@ import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.concurrent.ThreadLocalRandom;
@@ -111,27 +114,49 @@ public final class DefaultChannelId implements ChannelId {
         MACHINE_ID = machineId;
     }
 
+    // ProcessHandle.current().pid() composed into a single ()J handle.
+    // Resolved lazily so java.lang.ProcessHandle is never touched on Java 8.
+    private static volatile MethodHandle processHandlePidHandle;
+
     static int processHandlePid(ClassLoader loader) {
         // pid is positive on unix, non{-1,0} on windows
         int nilValue = -1;
         if (PlatformDependent.javaVersion() >= 9) {
-            Long pid;
+            long pid;
             try {
-                Class<?> processHandleImplType = Class.forName("java.lang.ProcessHandle", true, loader);
-                Method processHandleCurrent = processHandleImplType.getMethod("current");
-                Object processHandleInstance = processHandleCurrent.invoke(null);
-                Method processHandlePid = processHandleImplType.getMethod("pid");
-                pid = (Long) processHandlePid.invoke(processHandleInstance);
-            } catch (Exception e) {
-                logger.debug("Could not invoke ProcessHandle.current().pid();", e);
+                pid = (long) resolveProcessHandlePid(loader).invokeExact();
+            } catch (Throwable t) {
+                logger.debug("Could not invoke ProcessHandle.current().pid();", t);
                 return nilValue;
             }
             if (pid > Integer.MAX_VALUE || pid < Integer.MIN_VALUE) {
                 throw new IllegalStateException("Current process ID exceeds int range: " + pid);
             }
-            return pid.intValue();
+            return (int) pid;
         }
         return nilValue;
+    }
+
+    private static MethodHandle resolveProcessHandlePid(ClassLoader loader) {
+        MethodHandle handle = processHandlePidHandle;
+        if (handle == null) {
+            try {
+                Class<?> processHandleImplType = Class.forName("java.lang.ProcessHandle", true, loader);
+                MethodHandles.Lookup lookup = MethodHandles.publicLookup();
+                MethodHandle processHandleCurrent =
+                        lookup.findStatic(processHandleImplType, "current",
+                                          MethodType.methodType(processHandleImplType));
+                MethodHandle processHandlePid =
+                        lookup.findVirtual(processHandleImplType, "pid", MethodType.methodType(long.class));
+                handle = MethodHandles.filterReturnValue(processHandleCurrent, processHandlePid);
+            } catch (Throwable t) {
+                logger.debug("Could not resolve ProcessHandle.current().pid();", t);
+                // Fall back to jmxPid on every call instead of re-resolving.
+                handle = MethodHandles.constant(long.class, -1);
+            }
+            processHandlePidHandle = handle;
+        }
+        return handle;
     }
 
     static int jmxPid(ClassLoader loader) {
